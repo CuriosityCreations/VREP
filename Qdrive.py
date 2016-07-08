@@ -6,6 +6,7 @@ import keras
 import random
 from nn import neural_net, LossHistory
 import time
+import csv
 
 vrep.simxFinish(-1) # just in case, close all opened connections
 
@@ -37,6 +38,18 @@ errorCode, collisionState3=vrep.simxReadCollision(clientID,collision_handle3,vre
 #Virtual Collision Sensor
 #errorCode,sensor_handle=vrep.simxGetObjectHandle(clientID,'Proximity_sensor',vrep.simx_opmode_oneshot_wait)
 #errorCode,detectionState,detectedPoint,detectedObjectHandle,detectedSurfaceNormalVector=vrep.simxReadProximitySensor(clientID,sensor_handle,vrep.simx_opmode_streaming)
+
+def log_results(filename, data_collect, loss_log):
+  # Save the results to a file so we can graph it later.
+  with open('CSVresults/' + filename + '_route.csv', 'w') as data_dump:
+    wr = csv.writer(data_dump)
+    wr.writerows(data_collect)
+
+  with open('CSVresults/' + filename + '_loss.csv', 'w') as lf:
+    wr = csv.writer(lf)
+    for loss_item in loss_log:
+      wr.writerow(loss_item)
+
 
 def process_minibatch(minibatch, model):
     """This does the heavy lifting, aka, the training. It's super jacked."""
@@ -77,7 +90,7 @@ def process_minibatch(minibatch, model):
 driveCount = 0
 max_driveCount = 0
 trainCount = 0
-target_speed = 50
+target_speed = 10
 fallback_speed = -40
 fallback_angle = -0.5
 fallback_sec = 1
@@ -88,9 +101,11 @@ near = 0.2
 
 #Kinect sample point
 kinectStart = 2
-kinectInterval = 42
+kinectInterval = 10
 kinectHeight = 32
-kinectMapsize = [48, 256]
+kinectMapsize = [48, 64]
+resolution = 100
+nn_actPoint = 90
 
 #Neural network parameters
 NUM_INPUT = 7
@@ -101,9 +116,10 @@ nn_param = [256, 256]
 observe = 1000  # Number of frames to observe before training.
 epsilon = 1
 final_epsilon = 0.001
-train_frames = 100000  # Number of frames to play.
+train_frames = 200000  # Number of frames to play.
 replay = []
 loss_log = []
+data_collect = []
 
 params = {
   "batchSize": 200,
@@ -112,6 +128,7 @@ params = {
 }
 batchSize = params['batchSize']
 buffer = params['buffer']
+
 model = neural_net(NUM_INPUT, nn_param)
 
 # Initial the speed
@@ -122,7 +139,7 @@ im.resize(kinectMapsize[0], kinectMapsize[1])  #Can be adjusted in VREP
 
 #Depth 0~1 to distance 0.2 ~ 3.3
 #dis = np.ones(kinectMapsize) * near + im * (far-near)
-dis = im * 100
+dis = im * resolution
 
 #Get the readings
 readings = []
@@ -147,8 +164,11 @@ while trainCount < train_frames:
   errorCode, collisionState2=vrep.simxReadCollision(clientID,collision_handle2,vrep.simx_opmode_buffer)
   errorCode, collisionState3=vrep.simxReadCollision(clientID,collision_handle3,vrep.simx_opmode_buffer)
   if collisionState1 == 1 or collisionState2==1 or collisionState3==1:
-    if maxroute < driveCount:
+    if maxroute < driveCount and  trainCount > observe:
       maxroute = driveCount
+      # Log the car's distance at this T.
+      data_collect.append([trainCount, maxroute])
+      
       driveCount = 0
     reward = PUNISH
     errorCode=vrep.simxSetJointTargetVelocity(clientID,motor_handle,fallback_speed, vrep.simx_opmode_streaming)
@@ -157,7 +177,8 @@ while trainCount < train_frames:
     errorCode=vrep.simxSetJointTargetVelocity(clientID,motor_handle,target_speed, vrep.simx_opmode_streaming)
     errorCode=vrep.simxSetJointTargetPosition(clientID,steer_handle, 0, vrep.simx_opmode_streaming)
   trainCount += 1
-  driveCount += 1
+  if trainCount > observe:
+    driveCount += 1
   
   # Choose an action.
   if random.random() < epsilon or trainCount < observe:
@@ -168,13 +189,17 @@ while trainCount < train_frames:
     action = (np.argmax(qval))  # best
   
   # Make an action
-  if action == 0:
-    errorCode=vrep.simxSetJointTargetPosition(clientID,steer_handle, 0.8, vrep.simx_opmode_streaming)
-  elif action == 1:
-    errorCode=vrep.simxSetJointTargetPosition(clientID,steer_handle,-0.8,vrep.simx_opmode_streaming)
-  else:
+  if min(state[0]) > nn_actPoint:
     errorCode=vrep.simxSetJointTargetPosition(clientID,steer_handle,0,vrep.simx_opmode_streaming)
-  
+    action = 0
+  else:
+    if action == 0:
+      errorCode=vrep.simxSetJointTargetPosition(clientID,steer_handle, 0.5, vrep.simx_opmode_streaming)
+    elif action == 1:
+      errorCode=vrep.simxSetJointTargetPosition(clientID,steer_handle,-0.5,vrep.simx_opmode_streaming)
+    else:
+      errorCode=vrep.simxSetJointTargetPosition(clientID,steer_handle,0,vrep.simx_opmode_streaming)
+
   
   #time.sleep(0.02)
   
@@ -185,7 +210,7 @@ while trainCount < train_frames:
   
   #Depth 0~1 to distance 0.2 ~ 3.3
   #new_dis = np.ones(kinectMapsize) * near + im * (far-near)
-  new_dis = im * 100
+  new_dis = im * resolution
   
   readings = []
   for i in range(0, NUM_INPUT):
@@ -195,7 +220,7 @@ while trainCount < train_frames:
   new_state = np.array([readings])
   new_state = new_state.astype(int)
   
-  # Replay storage  lambda = 1
+  # Replay storage  lambda = 1 sarsa(0)
   replay.append((state, action, reward, new_state))
   
   #Get New Rewards
@@ -240,6 +265,18 @@ while trainCount < train_frames:
   if epsilon > final_epsilon and trainCount > observe:
     epsilon -= (1/train_frames)
   print (epsilon)
+  
+  # Save the model every 25,000 frames.
+  filename = 'train1'
+  if trainCount % 25000 == 0:
+    model.save_weights('saved-models/' + filename + '-' +
+                               str(trainCount) + '.h5',
+                               overwrite=True)
+    print("Saving model %s - %d" % (filename, trainCount))
+  
+  #Write the CSV file
+  log_results(filename, data_collect, loss_log)
+  
   #lock motor when velocity is zero
   #errorCode=vrep.simxSetJointTargetVelocity(clientID,motor_handle,1000, vrep.simx_opmode_streaming)
   #errorCode=vrep.simxSetJointForce(clientID,motor_handle,1, vrep.simx_opmode_oneshot)
